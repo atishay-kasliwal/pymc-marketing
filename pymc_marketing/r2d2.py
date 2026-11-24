@@ -92,9 +92,15 @@ Gotchas
 
 - **Shared decomposition**: All ``split()`` and ``error_sigma`` references share the
   same underlying Dirichlet. Changing one affects all.
+
+- **concentration is per coefficient**: A component's value is used for each of its
+  coefficients, so a component with more coefficients gets a larger share of the
+  total concentration.
 """
 
+import math
 from dataclasses import dataclass, field
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -308,6 +314,14 @@ class R2D2:
         scales. If False, sample standard-normal offsets and construct the
         coefficients deterministically; this can improve sampling when
         Dirichlet weights are small.
+    concentration : float or dict[str, float], default=1.0
+        Concentration of the Dirichlet prior that splits the model variance,
+        given per coefficient. A float is used for every coefficient. A dict
+        maps component names to the value used for each coefficient of that
+        component; components not in the dict use 1.0. Values below 1 favor
+        a few large coefficients (stronger shrinkage, 0.5 is the brms
+        default), 1 is uniform over the simplex, and values above 1 spread
+        the variance more evenly. Must be positive.
 
     Example
     -------
@@ -348,7 +362,9 @@ class R2D2:
     -----
     - The ``r2`` prior controls global shrinkage (how much variance the model explains).
     - The ``total_sigma`` prior controls the overall scale of coefficients.
-    - The Dirichlet prior (currently flat, a_π=1) splits model variance across components.
+    - The Dirichlet prior splits model variance across coefficients. Its
+      concentration is flat (a_π=1) unless ``concentration`` is given, following
+      the asymmetric Dirichlet of Aguilar & Bürkner (2022, Section 2.2).
     - ``centered`` selects the historical centered coefficient parameterization or
       a non-centered offset parameterization, which can improve sampling when
       local Dirichlet scales are small.
@@ -361,6 +377,7 @@ class R2D2:
     total_sigma: Prior
     dims: dict[str, str]  # component_name -> dim_name
     centered: bool = True
+    concentration: float | dict[str, float] = 1.0
 
     def __post_init__(self) -> None:
         """Validate parameters and initialize state."""
@@ -400,9 +417,40 @@ class R2D2:
                     f"Example: dims={{'control': 'control'}}"
                 )
 
+        self._validate_concentration()
+
         self._splits: dict[str, pt.TensorVariable] = {}
         self._error_sigma: pt.TensorVariable | None = None
         self._built_model_id: int | None = None  # Track which model this was built for
+
+    def _validate_concentration(self) -> None:
+        def check_value(value: Any, label: str) -> None:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"{label} must be a positive finite number, got {value!r}."
+                )
+
+        if isinstance(self.concentration, dict):
+            unknown = set(self.concentration) - set(self.dims)
+            if unknown:
+                raise ValueError(
+                    f"concentration has keys that are not components in dims: "
+                    f"{sorted(unknown)}. Available components: {list(self.dims)}."
+                )
+            for comp_name, value in self.concentration.items():
+                check_value(value, f"concentration['{comp_name}']")
+        else:
+            check_value(self.concentration, "concentration")
+
+    def _component_concentration(self, component_name: str) -> float:
+        if isinstance(self.concentration, dict):
+            return float(self.concentration.get(component_name, 1.0))
+        return float(self.concentration)
 
     def create_variable(self, name: str) -> pt.TensorVariable:
         """Create all decomposition variables ONCE inside pm.Model.
@@ -435,16 +483,20 @@ class R2D2:
         dim_sizes = {}
         for comp, dim in self.dims.items():
             dim_sizes[comp] = int(model.dim_lengths[dim].eval())
-        K = sum(dim_sizes.values())
 
         # Collect actual variable names from each component's dim
         split_dim_values = []
         for _comp_name, dim_name in self.dims.items():
             split_dim_values.extend(model.coords[dim_name])
 
-        # Dirichlet with K elements (one per coefficient across all components)
+        # Dirichlet with one element per coefficient across all components,
+        # each with the concentration of its component
+        concentrations = np.repeat(
+            [self._component_concentration(comp) for comp in self.dims],
+            [dim_sizes[comp] for comp in self.dims],
+        )
         model.add_coord(f"{name}_split", split_dim_values)
-        split = pm.Dirichlet(f"{name}_weights", np.ones(K), dims=(f"{name}_split",))
+        split = pm.Dirichlet(f"{name}_weights", concentrations, dims=(f"{name}_split",))
 
         # Slice Dirichlet into per-component groups
         # Store as xtensor for compatibility with pmd.Data
@@ -523,6 +575,12 @@ class R2D2:
         }
         if not self.centered:
             result["centered"] = False
+        if isinstance(self.concentration, dict):
+            result["concentration"] = {
+                comp: float(value) for comp, value in self.concentration.items()
+            }
+        elif self.concentration != 1.0:
+            result["concentration"] = float(self.concentration)
         return result
 
     @classmethod
@@ -539,6 +597,7 @@ class R2D2:
             total_sigma=_deserialize_prior(data["total_sigma"]),
             dims=data["dims"],
             centered=data.get("centered", True),
+            concentration=data.get("concentration", 1.0),
         )
 
 

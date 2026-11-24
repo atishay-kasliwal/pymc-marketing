@@ -377,6 +377,74 @@ class TestR2D2:
                 assert "beta" in {det.name for det in model.deterministics}
 
 
+class TestR2D2Concentration:
+    """Tests for the Dirichlet concentration of the variance split."""
+
+    coords = {"control": ["a", "b", "c"], "fourier": ["sin_1", "cos_1"]}
+
+    def make_r2d2(self, **kwargs):
+        return R2D2(
+            r2=Prior("Beta", mu=0.8, sigma=0.2),
+            total_sigma=Prior("HalfNormal", sigma=1),
+            dims={"control": "control", "fourier": "fourier"},
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({}, [1.0, 1.0, 1.0, 1.0, 1.0]),
+            ({"concentration": 0.5}, [0.5, 0.5, 0.5, 0.5, 0.5]),
+            (
+                {"concentration": {"control": 2.0, "fourier": 0.5}},
+                [2.0, 2.0, 2.0, 0.5, 0.5],
+            ),
+            ({"concentration": {"fourier": 3}}, [1.0, 1.0, 1.0, 3.0, 3.0]),
+        ],
+        ids=["default", "scalar", "per_component", "missing_component"],
+    )
+    def test_concentration_per_coefficient(self, kwargs, expected):
+        """Each coefficient gets the concentration of its component."""
+        r2d2 = self.make_r2d2(**kwargs)
+
+        with pm.Model(coords=self.coords) as model:
+            r2d2.create_variable("r2d2")
+            weights = model["r2d2_weights"]
+            np.testing.assert_array_equal(weights.owner.inputs[-1].eval(), expected)
+
+    def test_prior_weights_follow_concentration(self):
+        """Prior Dirichlet weights average to concentration / sum(concentration)."""
+        r2d2 = self.make_r2d2(concentration={"control": 2.0, "fourier": 0.5})
+
+        with pm.Model(coords=self.coords):
+            r2d2.create_variable("r2d2")
+            idata = pm.sample_prior_predictive(
+                draws=4000, var_names=["r2d2_weights"], random_seed=1
+            )
+
+        mean = idata.prior["r2d2_weights"].mean(("chain", "draw")).to_numpy()
+        expected = np.array([2.0, 2.0, 2.0, 0.5, 0.5]) / 7.0
+        np.testing.assert_allclose(mean, expected, atol=0.01)
+
+    @pytest.mark.parametrize(
+        "concentration, match",
+        [
+            (0, "positive finite number"),
+            (-1.0, "positive finite number"),
+            (np.nan, "positive finite number"),
+            (np.inf, "positive finite number"),
+            (True, "positive finite number"),
+            ("2", "positive finite number"),
+            ({"control": 0.0}, "positive finite number"),
+            ({"seasonality": 2.0}, "not components in dims"),
+        ],
+    )
+    def test_invalid_concentration_raises(self, concentration, match):
+        """Concentration must be positive and only name known components."""
+        with pytest.raises(ValueError, match=match):
+            self.make_r2d2(concentration=concentration)
+
+
 class TestR2D2Serialization:
     """Tests for R2D2 serialization."""
 
@@ -414,6 +482,31 @@ class TestR2D2Serialization:
 
         assert isinstance(restored, R2D2)
         assert restored.centered is False
+
+    @pytest.mark.parametrize("concentration", [0.5, {"control": 2.0}])
+    def test_concentration_round_trip(self, concentration):
+        """Serialization round-trip should preserve the concentration."""
+        r2d2 = R2D2(
+            r2=Prior("Beta", mu=0.8, sigma=0.2),
+            total_sigma=Prior("LogNormal", mu=0, sigma=1),
+            dims={"control": "control"},
+            concentration=concentration,
+        )
+
+        restored = serialization.deserialize(serialization.serialize(r2d2))
+
+        assert isinstance(restored, R2D2)
+        assert restored.concentration == concentration
+
+    def test_default_concentration_not_serialized(self):
+        """The default concentration leaves the serialized form unchanged."""
+        r2d2 = R2D2(
+            r2=Prior("Beta", mu=0.8, sigma=0.2),
+            total_sigma=Prior("LogNormal", mu=0, sigma=1),
+            dims={"control": "control"},
+        )
+
+        assert "concentration" not in r2d2.to_dict()
 
     def test_split_round_trip(self):
         """R2D2Split serialization round-trip."""
